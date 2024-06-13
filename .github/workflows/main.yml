@@ -1,0 +1,197 @@
+import time
+import logging
+from datetime import datetime
+import tkinter as tk
+from selenium import webdriver
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.chrome.options import Options
+from webdriver_manager.chrome import ChromeDriverManager
+from telegram import Bot
+import pandas as pd
+import numpy as np
+import ta
+import os
+
+# إعداد التسجيل
+logging.basicConfig(filename='trading_bot.log', level=logging.INFO, 
+                    format='%(asctime)s - %(levelname)s - %(message)s')
+
+# إعداد عميل Telegram
+bot_token = '7348938865:AAGCVlUbuIOUUjvD5ftunmInm-JeOTkjpME'
+chat_id = '2237958471'
+bot = Bot(token=bot_token)
+
+# بيانات تسجيل الدخول إلى Pocket Option
+username = 'ahmed2004@gmail.com'
+password = 'akedakedaked'
+
+# إعداد متصفح Selenium
+options = Options()
+options.add_argument('--headless')
+service = Service(ChromeDriverManager().install())
+driver = webdriver.Chrome(service=service, options=options)
+# تسجيل الدخول إلى Pocket Option
+def login_to_pocket_option():
+    try:
+        driver.get('https://pocketoption.com/en/login/')
+        time.sleep(3)
+        email_input = driver.find_element(By.NAME, 'email')
+        password_input = driver.find_element(By.NAME, 'password')
+        email_input.send_keys(username)
+        password_input.send_keys(password)
+        password_input.send_keys(Keys.RETURN)
+        time.sleep(5)
+        logging.info("Successfully logged in to Pocket Option")
+    except Exception as e:
+        logging.error(f"Failed to login to Pocket Option: {e}")
+
+# جلب بيانات السوق
+def get_market_data(pair):
+    try:
+        driver.get(f'https://pocketoption.com/en/trading/{pair}/')
+        time.sleep(3)
+        data_elements = driver.find_elements(By.CLASS_NAME, 'market-data-class')
+        data = {
+            'timestamp': [],
+            'open': [],
+            'high': [],
+            'low': [],
+            'close': []
+        }
+        for element in data_elements:
+            data['timestamp'].append(element.find_element(By.CLASS_NAME, 'timestamp-class').text)
+            data['open'].append(float(element.find_element(By.CLASS_NAME, 'open-class').text))
+            data['high'].append(float(element.find_element(By.CLASS_NAME, 'high-class').text))
+            data['low'].append(float(element.find_element(By.CLASS_NAME, 'low-class').text))
+            data['close'].append(float(element.find_element(By.CLASS_NAME, 'close-class').text))
+        df = pd.DataFrame(data)
+        df['timestamp'] = pd.to_datetime(df['timestamp'])
+        df.set_index('timestamp', inplace=True)
+        logging.info("Market data fetched successfully")
+        return df
+    except Exception as e:
+        logging.error(f"Failed to fetch market data: {e}")
+        return pd.DataFrame()
+
+# إعادة تصنيف البيانات
+def resample_data(data, timeframe):
+    try:
+        resampled_data = data.resample(timeframe).agg({
+            'open': 'first',
+            'high': 'max',
+            'low': 'min',
+            'close': 'last'
+        }).dropna()
+        logging.info("Data resampled successfully")
+        return resampled_data
+    except Exception as e:
+        logging.error(f"Failed to resample data: {e}")
+        return data
+        # حساب المؤشرات الفنية
+def calculate_indicators(data):
+    try:
+        data['SMA_20'] = ta.trend.sma_indicator(data['close'], window=20)
+        data['SMA_50'] = ta.trend.sma_indicator(data['close'], window=50)
+        data['Stochastic'] = ta.momentum.stoch(data['high'], data['low'], data['close'], window=14, smooth_window=3)
+        data['RSI'] = ta.momentum.rsi(data['close'], window=14)
+        logging.info("Indicators calculated successfully")
+        return data
+    except Exception as e:
+        logging.error(f"Failed to calculate indicators: {e}")
+        return data
+
+# تحديد إشارات التداول
+def identify_trade_signals(data):
+    try:
+        data['Buy_Signal'] = np.where((data['close'] > data['SMA_20']) & (data['SMA_20'] > data['SMA_50']), 1, 0)
+        data['Sell_Signal'] = np.where((data['close'] < data['SMA_20']) & (data['SMA_20'] < data['SMA_50']), 1, 0)
+        data['RSI_Buy_Signal'] = np.where(data['RSI'] < 30, 1, 0)
+        data['RSI_Sell_Signal'] = np.where(data['RSI'] > 70, 1, 0)
+        logging.info("Trade signals identified successfully")
+        return data
+    except Exception as e:
+        logging.error(f"Failed to identify trade signals: {e}")
+        return data
+        # إرسال إشارات التداول
+def send_trade_signal(signal, price, timestamp, pair, accuracy, reason, duration):
+    try:
+        message = f"""
+📈 صفقة {'شراء' if signal == 1 else 'بيع'}
+📊 زوج: {pair}
+📈 نسبة الزوج: {accuracy:.2f}%
+🕒 وقت دخول الصفقة: {timestamp}
+⏱ مدة الصفقة: {duration} دقيقة
+🎯 دقة الصفقة: {accuracy:.2f}%
+📈 سبب دخول الصفقة: {reason}
+"""
+        bot.send_message(chat_id=chat_id, text=message)
+        logging.info("Trade signal sent successfully")
+    except Exception as e:
+        logging.error(f"Failed to send trade signal: {e}")
+
+# بدء تشغيل البوت
+def run_bot():
+    try:
+        login_to_pocket_option()
+        pair = 'BTCUSD'  # زوج التداول
+        timeframe = '2T'  # الإطار الزمني (كل دقيقتين)
+
+        while True:
+            data = get_market_data(pair)
+            if not data.empty:
+                data = resample_data(data, timeframe)
+                data = calculate_indicators(data)
+                data = identify_trade_signals(data)
+                
+                latest_data = data.iloc[-1]
+                
+                if latest_data['Buy_Signal'] == 1 or latest_data['RSI_Buy_Signal'] == 1:
+                    duration = 1 if latest_data['Buy_Signal'] == 1 else 5
+                    reason = 'تجاوز المتوسط المتحرك 20 للمتوسط المتحرك 50' if latest_data['Buy_Signal'] == 1 else 'RSI أقل من 30'
+                    send_trade_signal(1, latest_data['close'], latest_data.name, pair, 95.0, reason, duration)
+                elif latest_data['Sell_Signal'] == 1 or latest_data['RSI_Sell_Signal'] == 1:
+                    duration = 1 if latest_data['Sell_Signal'] == 1 else 5
+                    reason = 'انخفاض المتوسط المتحرك 20 عن المتوسط المتحرك 50' if latest_data['Sell_Signal'] == 1 else 'RSI أعلى من 70'
+                    send_trade_signal(-1, latest_data['close'], latest_data.name, pair, 95.0, reason, duration)
+            
+            time.sleep(120)  # الانتظار لمدة دقيقتين قبل التحقق مرة أخرى
+    except Exception as e:
+        logging.error(f"Error in running bot: {e}")
+        # واجهة المستخدم
+def start_bot():
+    global bot_token, chat_id, username, password
+    bot_token = entry1.get()
+    chat_id = entry2.get()
+    username = entry3.get()
+    password = entry4.get()
+    run_bot()
+
+root = tk.Tk()
+root.title("Trading Bot")
+
+label1 = tk.Label(root, text="Telegram Bot Token")
+label1.pack()
+entry1 = tk.Entry(root)
+entry1.pack()
+
+label2 = tk.Label(root, text="Chat ID")
+label2.pack()
+entry2 = tk.Entry(root)
+entry2.pack()
+
+label3 = tk.Label(root, text="Pocket Option Email")
+label3.pack()
+entry3 = tk.Entry(root)
+entry3.pack()
+
+label4 = tk.Label(root, text="Pocket Option Password")
+label4.pack()
+entry4 = tk.Entry(root, show="*")
+entry4.pack()
+
+start_button = tk.Button(root, text="Start Bot", command=start_bot)
+start_button.pack()
+
+root.mainloop()
